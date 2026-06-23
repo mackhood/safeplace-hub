@@ -1,0 +1,22 @@
+# Entorno virtual Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Config con credenciales (no commitear)
+.env
+
+# Base de datos local
+*.db
+*.db-shm
+*.db-wal
+
+# Logs
+logger.txt
+*.log
+
+# Sistema
+.DS_Store
+Thumbs.db

@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SafePlace Hub</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:      #0f172a;
+    --surface: #1e293b;
+    --border:  #334155;
+    --accent:  #22d3ee;
+    --green:   #22c55e;
+    --red:     #f43f5e;
+    --text:    #f1f5f9;
+    --muted:   #94a3b8;
+    --radius:  16px;
+  }
+
+  body { background: var(--bg); color: var(--text); font-family: system-ui, sans-serif; min-height: 100vh; }
+
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 20px 32px; border-bottom: 1px solid var(--border);
+    background: var(--surface);
+  }
+  header h1 { font-size: 1.4rem; font-weight: 700; letter-spacing: -0.5px; }
+  header h1 span { color: var(--accent); }
+
+  .btn {
+    background: var(--accent); color: #0f172a; border: none; cursor: pointer;
+    padding: 10px 20px; border-radius: 10px; font-weight: 700; font-size: .9rem;
+    transition: opacity .15s;
+  }
+  .btn:hover { opacity: .85; }
+  .btn:disabled { opacity: .4; cursor: not-allowed; }
+
+  main { padding: 32px; max-width: 1100px; margin: 0 auto; }
+
+  .section-title {
+    font-size: .75rem; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 1px; color: var(--muted); margin-bottom: 16px;
+  }
+
+  #devices { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 20px; }
+
+  .card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 24px; display: flex; flex-direction: column; gap: 16px;
+    transition: border-color .2s;
+  }
+  .card.connected { border-color: var(--green); }
+  .card.disconnected { opacity: .6; }
+
+  .card-header { display: flex; align-items: flex-start; justify-content: space-between; }
+  .device-info { display: flex; flex-direction: column; gap: 4px; }
+  .device-name { font-weight: 700; font-size: 1rem; }
+  .device-addr { font-size: .75rem; color: var(--muted); font-family: monospace; }
+
+  .status-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; margin-top: 4px; }
+  .status-dot.on  { background: var(--green); box-shadow: 0 0 8px var(--green); animation: pulse 2s infinite; }
+  .status-dot.off { background: var(--muted); }
+
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
+
+  .bpm-wrap { text-align: center; }
+  .bpm-value { font-size: 3.5rem; font-weight: 800; line-height: 1; color: var(--accent); }
+  .bpm-value.flash { animation: flash .3s; }
+  @keyframes flash { 0%,100% { opacity:1; } 50% { opacity:.5; } }
+  .bpm-label { font-size: .75rem; color: var(--muted); margin-top: 2px; letter-spacing: 2px; text-transform: uppercase; }
+
+  .sparkline { width: 100%; height: 48px; }
+
+  .card-footer { display: flex; align-items: center; justify-content: space-between; }
+  .last-seen { font-size: .75rem; color: var(--muted); }
+  .remove-btn {
+    background: none; border: 1px solid var(--border); color: var(--muted);
+    cursor: pointer; border-radius: 8px; padding: 4px 10px; font-size: .75rem;
+    transition: all .15s;
+  }
+  .remove-btn:hover { border-color: var(--red); color: var(--red); }
+
+  #empty { grid-column: 1/-1; text-align: center; padding: 80px 20px; color: var(--muted); display: none; }
+  #empty p { margin-top: 12px; font-size: .9rem; }
+
+  #modal {
+    display: none; position: fixed; inset: 0; background: rgba(0,0,0,.7);
+    align-items: center; justify-content: center; z-index: 100;
+  }
+  #modal.open { display: flex; }
+
+  .modal-box {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 28px; width: 100%; max-width: 500px;
+    max-height: 80vh; display: flex; flex-direction: column; gap: 20px;
+  }
+  .modal-header { display: flex; justify-content: space-between; align-items: center; }
+  .modal-box h2 { font-size: 1.1rem; font-weight: 700; }
+  .modal-close { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 1.4rem; line-height: 1; }
+
+  #scan-status { font-size: .85rem; color: var(--muted); }
+  #scan-results { overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
+
+  .scan-item {
+    display: flex; align-items: center; justify-content: space-between;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
+    padding: 12px 16px;
+  }
+  .scan-item-info { display: flex; flex-direction: column; gap: 2px; }
+  .scan-item-name { font-weight: 600; font-size: .9rem; }
+  .scan-item-meta { font-size: .75rem; color: var(--muted); font-family: monospace; }
+
+  .tag { font-size: .7rem; padding: 3px 8px; border-radius: 6px; font-weight: 600; }
+  .tag.added { background: #164e63; color: var(--accent); }
+
+  .add-btn {
+    background: var(--accent); color: #0f172a; border: none; cursor: pointer;
+    padding: 6px 14px; border-radius: 8px; font-weight: 700; font-size: .8rem;
+  }
+  .add-btn:hover { opacity: .85; }
+
+  .spinner {
+    display: inline-block; width: 14px; height: 14px; border: 2px solid var(--border);
+    border-top-color: var(--accent); border-radius: 50%; animation: spin .6s linear infinite;
+    vertical-align: middle; margin-right: 6px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Safe<span>Place</span> Hub</h1>
+  <button class="btn" id="scanBtn">+ Agregar dispositivo</button>
+</header>
+
+<main>
+  <p class="section-title">Dispositivos activos</p>
+  <div id="devices">
+    <div id="empty">
+      <div style="font-size:2.5rem">📡</div>
+      <p>No hay dispositivos configurados.<br>Hacé clic en <strong>Agregar dispositivo</strong> para escanear.</p>
+    </div>
+  </div>
+</main>
+
+<div id="modal">
+  <div class="modal-box">
+    <div class="modal-header">
+      <h2>Agregar dispositivo</h2>
+      <button class="modal-close" id="closeModal">&times;</button>
+    </div>
+    <div id="scan-status">Iniciando escaneo BLE (8s)...</div>
+    <div id="scan-results"></div>
+  </div>
+</div>
+
+<script>
+const state = {};
+
+const es = new EventSource('/api/stream');
+es.onmessage = function(e) {
+  const devices = JSON.parse(e.data);
+  devices.forEach(function(d) {
+    const prev = state[d.address];
+    state[d.address] = Object.assign({}, d, { name: (prev && prev.name) ? prev.name : d.address });
+  });
+  render();
+};
+
+function ago(ts) {
+  if (!ts) return 'nunca';
+  const s = Math.round(Date.now() / 1000 - ts);
+  if (s < 5)  return 'ahora';
+  if (s < 60) return 'hace ' + s + 's';
+  if (s < 3600) return 'hace ' + Math.round(s/60) + 'min';
+  return 'hace ' + Math.round(s/3600) + 'h';
+}
+
+function sparkline(vals, w, h) {
+  w = w || 240; h = h || 44;
+  if (!vals || vals.length < 2) return '';
+  var min = Math.min.apply(null, vals);
+  var max = Math.max.apply(null, vals);
+  var range = max - min || 1;
+  var pts = vals.map(function(v, i) {
+    var x = (i / (vals.length - 1)) * w;
+    var y = h - ((v - min) / range) * (h - 4) - 2;
+    return x.toFixed(1) + ',' + y.toFixed(1);
+  }).join(' ');
+  return '<svg class="sparkline" viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none">' +
+    '<defs><linearGradient id="sg" x1="0" y1="0" x2="0" y2="1">' +
+    '<stop offset="0%" stop-color="#22d3ee" stop-opacity=".25"/>' +
+    '<stop offset="100%" stop-color="#22d3ee" stop-opacity="0"/>' +
+    '</linearGradient></defs>' +
+    '<polygon points="0,' + h + ' ' + pts + ' ' + w + ',' + h + '" fill="url(#sg)"/>' +
+    '<polyline points="' + pts + '" fill="none" stroke="#22d3ee" stroke-width="2" stroke-linejoin="round"/>' +
+    '</svg>';
+}
+
+function render() {
+  var container = document.getElementById('devices');
+  var empty     = document.getElementById('empty');
+  var entries   = Object.values(state);
+
+  if (!entries.length) { empty.style.display = 'block'; return; }
+  empty.style.display = 'none';
+
+  entries.forEach(function(d) {
+    var card   = document.getElementById('card-' + d.address);
+    var isNew  = !card;
+
+    if (isNew) {
+      card = document.createElement('div');
+      card.id = 'card-' + d.address;
+      container.appendChild(card);
+    }
+
+    var bpmEl   = card.querySelector('.bpm-value');
+    var prevBpm = bpmEl ? bpmEl.textContent : null;
+    var newBpm  = d.bpm != null ? d.bpm : '—';
+
+    card.className = 'card ' + (d.connected ? 'connected' : 'disconnected');
+    card.innerHTML =
+      '<div class="card-header">' +
+        '<div class="device-info">' +
+          '<span class="device-name">' + (d.name || d.address) + '</span>' +
+          '<span class="device-addr">' + d.address + '</span>' +
+        '</div>' +
+        '<div class="status-dot ' + (d.connected ? 'on' : 'off') + '"></div>' +
+      '</div>' +
+      '<div class="bpm-wrap">' +
+        '<div class="bpm-value">' + newBpm + '</div>' +
+        '<div class="bpm-label">BPM</div>' +
+      '</div>' +
+      sparkline(d.history) +
+      '<div class="card-footer">' +
+        '<span class="last-seen">' + (d.connected ? 'En vivo · ' : '') + ago(d.last_seen) + '</span>' +
+        '<button class="remove-btn" onclick="removeDevice(\'' + d.address + '\')">Eliminar</button>' +
+      '</div>';
+
+    if (prevBpm && prevBpm !== String(newBpm)) {
+      var v = card.querySelector('.bpm-value');
+      if (v) { v.classList.add('flash'); setTimeout(function(){ v.classList.remove('flash'); }, 350); }
+    }
+  });
+
+  document.querySelectorAll('.card').forEach(function(c) {
+    var addr = c.id.replace('card-', '');
+    if (!state[addr]) c.remove();
+  });
+}
+
+document.getElementById('scanBtn').addEventListener('click', openScan);
+document.getElementById('closeModal').addEventListener('click', closeModal);
+document.getElementById('modal').addEventListener('click', function(e) {
+  if (e.target === document.getElementById('modal')) closeModal();
+});
+
+function openScan() {
+  document.getElementById('modal').classList.add('open');
+  document.getElementById('scan-results').innerHTML = '';
+  document.getElementById('scan-status').innerHTML = '<span class="spinner"></span> Escaneando dispositivos BLE cercanos (8s)...';
+  fetch('/api/scan')
+    .then(function(r) { return r.json(); })
+    .then(renderScanResults)
+    .catch(function() { document.getElementById('scan-status').textContent = 'Error en el escaneo.'; });
+}
+
+function closeModal() {
+  document.getElementById('modal').classList.remove('open');
+}
+
+function renderScanResults(devices) {
+  var status  = document.getElementById('scan-status');
+  var results = document.getElementById('scan-results');
+
+  if (!devices.length) {
+    status.textContent = 'No se encontraron dispositivos con Heart Rate. Asegurate de iniciar una actividad en el wearable.';
+    return;
+  }
+  status.textContent = 'Se encontraron ' + devices.length + ' dispositivo(s) con Heart Rate:';
+  results.innerHTML = devices.map(function(d) {
+    return '<div class="scan-item" id="scan-' + d.address + '">' +
+      '<div class="scan-item-info">' +
+        '<span class="scan-item-name">' + d.name + '</span>' +
+        '<span class="scan-item-meta">' + d.address + ' · ' + d.rssi + ' dBm</span>' +
+      '</div>' +
+      (d.already_added
+        ? '<span class="tag added">Ya agregado</span>'
+        : '<button class="add-btn" onclick="addDevice(\'' + d.address + '\', \'' + d.name + '\')">+ Agregar</button>'
+      ) +
+    '</div>';
+  }).join('');
+}
+
+function addDevice(addr, name) {
+  var btn = document.querySelector('#scan-' + addr + ' .add-btn');
+  if (btn) { btn.textContent = '...'; btn.disabled = true; }
+  fetch('/api/devices/' + addr, { method: 'POST' })
+    .then(function(r) { return r.json(); })
+    .then(function() {
+      state[addr] = { address: addr, name: name, bpm: null, history: [], connected: false, last_seen: null };
+      var item = document.querySelector('#scan-' + addr);
+      if (item) {
+        var addBtn = item.querySelector('.add-btn');
+        if (addBtn) addBtn.outerHTML = '<span class="tag added">Agregado</span>';
+      }
+    })
+    .catch(function() { if (btn) { btn.textContent = '+ Agregar'; btn.disabled = false; } });
+}
+
+function removeDevice(addr) {
+  if (!confirm('Eliminar ' + (state[addr] ? state[addr].name : addr) + '?')) return;
+  fetch('/api/devices/' + addr, { method: 'DELETE' })
+    .then(function() {
+      delete state[addr];
+      var card = document.getElementById('card-' + addr);
+      if (card) card.remove();
+      if (!Object.keys(state).length) document.getElementById('empty').style.display = 'block';
+    });
+}
+</script>
+</body>
+</html>
