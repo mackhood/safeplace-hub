@@ -297,13 +297,14 @@ function renderScanResults(devices) {
 }
 
 function addDevice(addr, name) {
-  var btn = document.querySelector('#scan-' + addr + ' .add-btn');
+  var scanItem = document.getElementById('scan-' + addr);
+  var btn = scanItem ? scanItem.querySelector('.add-btn') : null;
   if (btn) { btn.textContent = '...'; btn.disabled = true; }
   fetch('/api/devices/' + addr, { method: 'POST' })
     .then(function(r) { return r.json(); })
     .then(function() {
       state[addr] = { address: addr, name: name, bpm: null, history: [], connected: false, last_seen: null };
-      var item = document.querySelector('#scan-' + addr);
+      var item = document.getElementById('scan-' + addr);
       if (item) {
         var addBtn = item.querySelector('.add-btn');
         if (addBtn) addBtn.outerHTML = '<span class="tag added">Agregado</span>';

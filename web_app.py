@@ -13,7 +13,7 @@ from bleak import BleakScanner
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 
-PROJECT_DIR = Path.home() / "safeplace-gateway"
+PROJECT_DIR = Path(os.getenv("PROJECT_DIR", str(Path.home() / "safeplace-gateway")))
 DB_PATH     = os.getenv("DB_PATH", str(PROJECT_DIR / "safeplace.db"))
 ENV_PATH    = PROJECT_DIR / ".env"
 SERVICE     = "safeplace-gateway"
@@ -49,7 +49,11 @@ def save_targets(targets: list[str]):
     ENV_PATH.write_text("\n".join(lines) + "\n")
 
 def restart_gateway():
-    subprocess.run(["sudo", "systemctl", "restart", SERVICE], check=True)
+    try:
+        subprocess.run(["sudo", "systemctl", "restart", SERVICE], check=True)
+    except (FileNotFoundError, subprocess.CalledProcessError) as e:
+        print(f"[dev] no se pudo reiniciar '{SERVICE}' via systemctl ({e}); "
+              f"reiniciá ble_gateway.py manualmente para aplicar TARGET_ADDRESSES")
 
 def devices_snapshot() -> list[dict]:
     env = read_env()
