@@ -1,9 +1,13 @@
 # Entorno virtual Python
 venv/
+.venv/
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# Runtime local de desarrollo
+.local/
 
 # Config con credenciales (no commitear)
 .env
