@@ -12,6 +12,7 @@ import time
 import os
 import signal
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from bleak import BleakClient, BleakScanner
@@ -19,8 +20,12 @@ import aiohttp
 
 # ─── Config ───────────────────────────────────────────────────────────
 
+# BACKEND_URL es la base del backend real de SafePlace (ej. http://host:8000,
+# sin path). Los paths de la API (/api/v1/mediciones, /api/v1/dispositivos/...)
+# son fijos, no configurables — son el contrato real del backend.
 BACKEND_URL      = os.getenv("BACKEND_URL", "")
-REPORT_ENDPOINT  = os.getenv("REPORT_ENDPOINT", "/api/heartrate")
+# Debe coincidir con GATEWAY_API_KEY del backend (header x-device-api-key,
+# mismo middleware que usa el resto del sistema para autenticar al gateway).
 API_KEY          = os.getenv("API_KEY", "")
 
 TARGET_ADDRESSES = [
@@ -190,12 +195,74 @@ async def scan_for_hr_devices() -> list:
     return found
 
 
+# MAC BLE -> id numérico de dispositivo en el backend (H0007). El backend
+# identifica todo por id, no por MAC; se resuelve una vez por dirección
+# (con reintento si todavía no está registrada) y se cachea en memoria.
+_device_id_cache: dict = {}
+
+
+async def resolve_device_id(session: aiohttp.ClientSession, address: str):
+    if not BACKEND_ENABLED:
+        return None
+    if address in _device_id_cache:
+        return _device_id_cache[address]
+
+    url = f"{BACKEND_URL}/api/v1/dispositivos/lookup"
+    headers = {"x-device-api-key": API_KEY} if API_KEY else {}
+    try:
+        async with session.get(
+            url, params={"mac": address}, headers=headers, timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                device_id = (data.get("data") or {}).get("id")
+                if device_id is not None:
+                    _device_id_cache[address] = device_id
+                    log.info("[%s] Resuelto a dispositivo id=%s", address, device_id)
+                return device_id
+            log.warning(
+                "[%s] No se pudo resolver el dispositivo (HTTP %d) — "
+                "¿falta cargar esta MAC en el backend?", address, resp.status,
+            )
+            return None
+    except Exception as e:
+        log.error("[%s] Error resolviendo dispositivo: %s", address, e)
+        return None
+
+
+async def report_connection_state(session: aiohttp.ClientSession, device_id, estado: str):
+    if not BACKEND_ENABLED or device_id is None:
+        return
+    url = f"{BACKEND_URL}/api/v1/dispositivos/{device_id}/estado-conexion"
+    headers = {"x-device-api-key": API_KEY} if API_KEY else {}
+    try:
+        async with session.post(
+            url, json={"estado": estado}, headers=headers, timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            if resp.status >= 300:
+                body = await resp.text()
+                log.warning("Reporte de estado %s: HTTP %d %s", estado, resp.status, body[:200])
+    except Exception as e:
+        log.error("Error reportando estado %s: %s", estado, e)
+
+
 async def _post_to_backend(session: aiohttp.ClientSession, reading: HRReading) -> bool:
     if not BACKEND_ENABLED:
         return False
-    url = f"{BACKEND_URL}{REPORT_ENDPOINT}"
-    payload = {"bpm": reading.bpm, "timestamp": reading.timestamp, "deviceAddress": reading.device_address}
-    headers = {"Authorization": f"Bearer {API_KEY}"} if API_KEY else {}
+
+    device_id = await resolve_device_id(session, reading.device_address)
+    if device_id is None:
+        log.warning("[%s] Sin dispositivo asociado en el backend — medición no enviada", reading.device_address)
+        return False
+
+    url = f"{BACKEND_URL}/api/v1/mediciones"
+    timestamp_iso = datetime.fromtimestamp(reading.timestamp, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    payload = {
+        "idDispositivo": device_id,
+        "timestamp": timestamp_iso,
+        "frecuenciaCardiaca": reading.bpm,
+    }
+    headers = {"x-device-api-key": API_KEY} if API_KEY else {}
     try:
         async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status < 300:
@@ -217,16 +284,20 @@ async def monitor_device(address: str, stop_event: asyncio.Event, store: HeartRa
         latest_bpm = parse_hr(data)
         log.info("[%s] HR: %d BPM", address, latest_bpm)
 
-    def on_disconnect(_client):
-        log.warning("[%s] Dispositivo desconectado", address)
-        stop_event.set()
+    async with aiohttp.ClientSession() as session:
+        device_id = await resolve_device_id(session, address)
 
-    log.info("Conectando a %s...", address)
-    async with BleakClient(address, timeout=15, disconnected_callback=on_disconnect) as client:
-        log.info("Conectado a %s", address)
-        await client.start_notify(HR_CHAR_UUID, on_hr)
+        def on_disconnect(_client):
+            log.warning("[%s] Dispositivo desconectado", address)
+            stop_event.set()
+            asyncio.create_task(report_connection_state(session, device_id, "DESCONECTADO"))
 
-        async with aiohttp.ClientSession() as session:
+        log.info("Conectando a %s...", address)
+        async with BleakClient(address, timeout=15, disconnected_callback=on_disconnect) as client:
+            log.info("Conectado a %s", address)
+            await report_connection_state(session, device_id, "CONECTADO")
+            await client.start_notify(HR_CHAR_UUID, on_hr)
+
             while not stop_event.is_set():
                 await asyncio.sleep(REPORT_INTERVAL)
 
