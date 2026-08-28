@@ -18,6 +18,8 @@ from pathlib import Path
 from bleak import BleakClient, BleakScanner
 import aiohttp
 
+from activity import estimator_from_env
+
 # ─── Config ───────────────────────────────────────────────────────────
 
 # BACKEND_URL es la base del backend real de SafePlace (ej. http://host:8000,
@@ -35,6 +37,11 @@ TARGET_ADDRESSES = [
 SCAN_TIMEOUT     = int(os.getenv("SCAN_TIMEOUT", "10"))
 RECONNECT_DELAY  = int(os.getenv("RECONNECT_DELAY", "5"))
 REPORT_INTERVAL  = int(os.getenv("REPORT_INTERVAL", "5"))
+
+# CP-E2E-04: N lecturas seguidas con EXACTAMENTE la misma pulsación => el
+# wearable no está midiendo de verdad (fuera de la muñeca) y se reporta
+# DESCONECTADO. A REPORT_INTERVAL=5s, 12 ≈ 1 min de pulso congelado.
+STUCK_READINGS_THRESHOLD = int(os.getenv("STUCK_READINGS_THRESHOLD", "12"))
 BUFFER_TTL       = int(os.getenv("BUFFER_TTL", "7200"))
 FLUSH_BATCH_SIZE = int(os.getenv("FLUSH_BATCH_SIZE", "50"))
 
@@ -64,6 +71,7 @@ class HRReading:
     bpm: int
     timestamp: float
     device_address: str
+    actividad: float | None = None
 
 
 # ─── Almacenamiento principal (heart_rate_log) ────────────────────────
@@ -88,6 +96,12 @@ class HeartRateStore:
                 created_at  REAL    NOT NULL DEFAULT (strftime('%s','now'))
             )
         """)
+        # Migración in-place para DBs anteriores (SQLite no tiene ADD COLUMN
+        # IF NOT EXISTS): nivel de actividad estimado por el gateway.
+        try:
+            self._conn.execute("ALTER TABLE heart_rate_log ADD COLUMN actividad REAL")
+        except sqlite3.OperationalError:
+            pass  # la columna ya existe
         self._conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_hr_sent
             ON heart_rate_log(sent, created_at)
@@ -98,8 +112,8 @@ class HeartRateStore:
 
     def save(self, reading: HRReading) -> int:
         cur = self._conn.execute(
-            "INSERT INTO heart_rate_log (bpm, timestamp, device_addr) VALUES (?, ?, ?)",
-            (reading.bpm, reading.timestamp, reading.device_address),
+            "INSERT INTO heart_rate_log (bpm, timestamp, device_addr, actividad) VALUES (?, ?, ?, ?)",
+            (reading.bpm, reading.timestamp, reading.device_address, reading.actividad),
         )
         self._conn.commit()
         return cur.lastrowid
@@ -115,7 +129,7 @@ class HeartRateStore:
 
     def fetch_unsent(self, limit: int = FLUSH_BATCH_SIZE) -> list:
         return self._conn.execute(
-            "SELECT id, bpm, timestamp, device_addr FROM heart_rate_log WHERE sent=0 ORDER BY id LIMIT ?",
+            "SELECT id, bpm, timestamp, device_addr, actividad FROM heart_rate_log WHERE sent=0 ORDER BY id LIMIT ?",
             (limit,),
         ).fetchall()
 
@@ -147,8 +161,8 @@ class BackendFlusher:
                     break
 
                 sent_ids = []
-                for row_id, bpm, ts, addr in batch:
-                    reading = HRReading(bpm=bpm, timestamp=ts, device_address=addr)
+                for row_id, bpm, ts, addr, actividad in batch:
+                    reading = HRReading(bpm=bpm, timestamp=ts, device_address=addr, actividad=actividad)
                     ok = await _post_to_backend(session, reading)
                     if ok:
                         sent_ids.append(row_id)
@@ -262,6 +276,8 @@ async def _post_to_backend(session: aiohttp.ClientSession, reading: HRReading) -
         "timestamp": timestamp_iso,
         "frecuenciaCardiaca": reading.bpm,
     }
+    if reading.actividad is not None:
+        payload["nivelActividad"] = reading.actividad
     headers = {"x-device-api-key": API_KEY} if API_KEY else {}
     try:
         async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
@@ -278,6 +294,13 @@ async def _post_to_backend(session: aiohttp.ClientSession, reading: HRReading) -
 
 async def monitor_device(address: str, stop_event: asyncio.Event, store: HeartRateStore, flusher: BackendFlusher):
     latest_bpm: int | None = None
+    estimator = estimator_from_env(os.environ)
+
+    # CP-E2E-04: si el wearable repite exactamente la misma pulsación
+    # STUCK_READINGS_THRESHOLD veces seguidas, no está midiendo de verdad
+    # (fuera de la muñeca) — se reporta DESCONECTADO y se dejan de enviar
+    # mediciones hasta que llegue un valor genuinamente distinto.
+    stuck_run = {"bpm": None, "count": 0, "reported": False}
 
     def on_hr(_sender, data: bytearray):
         nonlocal latest_bpm
@@ -301,18 +324,43 @@ async def monitor_device(address: str, stop_event: asyncio.Event, store: HeartRa
             while not stop_event.is_set():
                 await asyncio.sleep(REPORT_INTERVAL)
 
-                if latest_bpm is not None:
-                    reading = HRReading(bpm=latest_bpm, timestamp=time.time(), device_address=address)
-                    row_id = store.save(reading)
-                    log.debug("[%s] Guardado en SQLite (id=%d)", address, row_id)
+                if latest_bpm is None:
+                    continue
 
-                    if BACKEND_ENABLED:
-                        ok = await _post_to_backend(session, reading)
-                        if ok:
-                            store.mark_sent([row_id])
-                            await flusher.flush(session)
-                        else:
-                            log.warning("[%s] Backend no disponible — reading en cola (id=%d)", address, row_id)
+                # --- Detección de pulso "congelado" ---
+                if latest_bpm == stuck_run["bpm"]:
+                    stuck_run["count"] += 1
+                else:
+                    if stuck_run["reported"]:
+                        log.info("[%s] Pulso vuelve a variar (%d BPM) — CONECTADO", address, latest_bpm)
+                        await report_connection_state(session, device_id, "CONECTADO")
+                    stuck_run.update(bpm=latest_bpm, count=1, reported=False)
+
+                if stuck_run["count"] >= STUCK_READINGS_THRESHOLD:
+                    if not stuck_run["reported"]:
+                        log.warning(
+                            "[%s] %d lecturas iguales seguidas (%d BPM) — se reporta DESCONECTADO",
+                            address, stuck_run["count"], latest_bpm,
+                        )
+                        await report_connection_state(session, device_id, "DESCONECTADO")
+                        stuck_run["reported"] = True
+                    continue  # no se guarda ni se envía un pulso congelado
+
+                actividad = estimator.update(latest_bpm)
+                reading = HRReading(
+                    bpm=latest_bpm, timestamp=time.time(),
+                    device_address=address, actividad=actividad,
+                )
+                row_id = store.save(reading)
+                log.debug("[%s] Guardado en SQLite (id=%d, act=%s)", address, row_id, actividad)
+
+                if BACKEND_ENABLED:
+                    ok = await _post_to_backend(session, reading)
+                    if ok:
+                        store.mark_sent([row_id])
+                        await flusher.flush(session)
+                    else:
+                        log.warning("[%s] Backend no disponible — reading en cola (id=%d)", address, row_id)
 
 
 async def monitor_loop(address: str, store: HeartRateStore, flusher: BackendFlusher, stop_event: asyncio.Event):
