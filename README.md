@@ -41,8 +41,20 @@ mediciones hasta que llega un valor genuinamente distinto (entonces reporta
 
 ## Herramientas de prueba (`tools/`)
 
-- `inject_measurements.py` — postea mediciones sintéticas al backend sin BLE.
-  Útil para CP-E2E-* (ver `docs/e2e/CP-E2E-04.md` del repo del backend).
+- `inject_measurements.py` — postea mediciones sintéticas al backend sin BLE
+  (parámetros libres: `--fc`, `--actividad`, `--count`, `--backdate-minutes`…).
+- `scenario_player.py` — reproduce escenarios E2E con nombre (`normal`,
+  `fatiga`, `sobreesfuerzo`, `no-asociado`, `sin-consentimiento`, `invalida`)
+  contra el endpoint real del backend. Ver `docs/e2e/README.md` del repo del
+  backend para la matriz completa de casos.
+
+## Arquitectura de módulos
+
+- `ble_gateway.py` — orquestador: scan/conexión BLE, loop de lectura,
+  detección de pulso congelado, reporte de estado de conexión.
+- `activity.py` — estimador de `nivelActividad` (proxy derivado de FC).
+- `hr_store.py` — persistencia SQLite (`HeartRateStore`) y cola de reenvío
+  (`BackendFlusher`). Sin dependencias de BLE/red → testeable en cualquier SO.
 
 ## Tests
 
@@ -50,3 +62,6 @@ mediciones hasta que llega un valor genuinamente distinto (entonces reporta
 pip install -r requirements-dev.txt
 pytest -q
 ```
+- `tests/test_activity.py` — proxy de actividad.
+- `tests/test_resiliencia.py` — CP-E2E-06: cola local, reenvío tras caída,
+  sin duplicados, persistencia entre reinicios.

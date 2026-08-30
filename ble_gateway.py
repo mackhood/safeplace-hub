@@ -19,6 +19,7 @@ from bleak import BleakClient, BleakScanner
 import aiohttp
 
 from activity import estimator_from_env
+from hr_store import HRReading, HeartRateStore, BackendFlusher
 
 # ─── Config ───────────────────────────────────────────────────────────
 
@@ -37,6 +38,12 @@ TARGET_ADDRESSES = [
 SCAN_TIMEOUT     = int(os.getenv("SCAN_TIMEOUT", "10"))
 RECONNECT_DELAY  = int(os.getenv("RECONNECT_DELAY", "5"))
 REPORT_INTERVAL  = int(os.getenv("REPORT_INTERVAL", "5"))
+
+# Modo de prueba: fuerza el id de dispositivo del backend en vez de resolverlo
+# por MAC. Necesario cuando el "wearable" es un simulador (macOS/Windows), cuya
+# dirección BLE es del hardware/aleatoria y no se puede registrar como MAC fija.
+FORCE_DEVICE_ID  = os.getenv("FORCE_DEVICE_ID", "").strip()
+FORCE_DEVICE_ID  = int(FORCE_DEVICE_ID) if FORCE_DEVICE_ID.isdigit() else None
 
 # CP-E2E-04: N lecturas seguidas con EXACTAMENTE la misma pulsación => el
 # wearable no está midiendo de verdad (fuera de la muñeca) y se reporta
@@ -60,124 +67,19 @@ _fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 log = logging.getLogger("ble-gateway")
 
-_fh = logging.FileHandler(LOG_FILE_PATH)
-_fh.setFormatter(_fmt)
-logging.getLogger().addHandler(_fh)
+# El log a archivo es best-effort: si el directorio no existe se intenta crear,
+# y si aun así falla (permisos, ejecución en un test) el gateway sigue
+# funcionando solo con el log a consola/journald.
+try:
+    Path(LOG_FILE_PATH).parent.mkdir(parents=True, exist_ok=True)
+    _fh = logging.FileHandler(LOG_FILE_PATH)
+    _fh.setFormatter(_fmt)
+    logging.getLogger().addHandler(_fh)
+except OSError as _e:
+    log.warning("No se pudo abrir el log de archivo %s: %s", LOG_FILE_PATH, _e)
 
-# ─── Modelo ───────────────────────────────────────────────────────────
-
-@dataclass
-class HRReading:
-    bpm: int
-    timestamp: float
-    device_address: str
-    actividad: float | None = None
-
-
-# ─── Almacenamiento principal (heart_rate_log) ────────────────────────
-
-class HeartRateStore:
-    """
-    Almacenamiento primario de todos los readings en SQLite.
-    Los datos nunca se borran automáticamente.
-    sent=0 → pendiente de enviar al backend; sent=1 → ya enviado.
-    """
-
-    def __init__(self, db_path: str = DB_PATH):
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("""
-            CREATE TABLE IF NOT EXISTS heart_rate_log (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                bpm         INTEGER NOT NULL,
-                timestamp   REAL    NOT NULL,
-                device_addr TEXT    NOT NULL,
-                sent        INTEGER NOT NULL DEFAULT 0,
-                created_at  REAL    NOT NULL DEFAULT (strftime('%s','now'))
-            )
-        """)
-        # Migración in-place para DBs anteriores (SQLite no tiene ADD COLUMN
-        # IF NOT EXISTS): nivel de actividad estimado por el gateway.
-        try:
-            self._conn.execute("ALTER TABLE heart_rate_log ADD COLUMN actividad REAL")
-        except sqlite3.OperationalError:
-            pass  # la columna ya existe
-        self._conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_hr_sent
-            ON heart_rate_log(sent, created_at)
-        """)
-        self._conn.commit()
-        count = self._conn.execute("SELECT COUNT(*) FROM heart_rate_log").fetchone()[0]
-        log.info("HeartRateStore listo — %d readings almacenados en total", count)
-
-    def save(self, reading: HRReading) -> int:
-        cur = self._conn.execute(
-            "INSERT INTO heart_rate_log (bpm, timestamp, device_addr, actividad) VALUES (?, ?, ?, ?)",
-            (reading.bpm, reading.timestamp, reading.device_address, reading.actividad),
-        )
-        self._conn.commit()
-        return cur.lastrowid
-
-    def mark_sent(self, ids: list):
-        if not ids:
-            return
-        placeholders = ",".join("?" * len(ids))
-        self._conn.execute(
-            f"UPDATE heart_rate_log SET sent=1 WHERE id IN ({placeholders})", ids
-        )
-        self._conn.commit()
-
-    def fetch_unsent(self, limit: int = FLUSH_BATCH_SIZE) -> list:
-        return self._conn.execute(
-            "SELECT id, bpm, timestamp, device_addr, actividad FROM heart_rate_log WHERE sent=0 ORDER BY id LIMIT ?",
-            (limit,),
-        ).fetchall()
-
-    def close(self):
-        self._conn.close()
-
-
-# ─── Buffer de reenvío al backend ────────────────────────────────────
-
-class BackendFlusher:
-    """
-    Usa la tabla heart_rate_log (sent=0) como cola de reenvío.
-    Solo activo cuando BACKEND_ENABLED=True.
-    """
-
-    def __init__(self, store: HeartRateStore):
-        self._store = store
-        self._lock = asyncio.Lock()
-
-    async def flush(self, session: aiohttp.ClientSession) -> int:
-        if not BACKEND_ENABLED or self._lock.locked():
-            return 0
-
-        async with self._lock:
-            total_sent = 0
-            while True:
-                batch = self._store.fetch_unsent()
-                if not batch:
-                    break
-
-                sent_ids = []
-                for row_id, bpm, ts, addr, actividad in batch:
-                    reading = HRReading(bpm=bpm, timestamp=ts, device_address=addr, actividad=actividad)
-                    ok = await _post_to_backend(session, reading)
-                    if ok:
-                        sent_ids.append(row_id)
-                    else:
-                        break
-
-                self._store.mark_sent(sent_ids)
-                total_sent += len(sent_ids)
-
-                if len(sent_ids) < len(batch):
-                    break
-
-            if total_sent > 0:
-                log.info("Backend flush: %d readings enviados", total_sent)
-            return total_sent
+# HRReading / HeartRateStore / BackendFlusher viven en hr_store.py (sin
+# dependencias de BLE ni red, para poder testear la resiliencia — CP-E2E-06).
 
 
 # ─── Funciones core ──────────────────────────────────────────────────
@@ -218,6 +120,8 @@ _device_id_cache: dict = {}
 async def resolve_device_id(session: aiohttp.ClientSession, address: str):
     if not BACKEND_ENABLED:
         return None
+    if FORCE_DEVICE_ID is not None:
+        return FORCE_DEVICE_ID
     if address in _device_id_cache:
         return _device_id_cache[address]
 
@@ -380,8 +284,10 @@ async def monitor_loop(address: str, store: HeartRateStore, flusher: BackendFlus
 
 async def run():
     stop_event = asyncio.Event()
-    store = HeartRateStore()
-    flusher = BackendFlusher(store)
+    store = HeartRateStore(DB_PATH)
+    flusher = BackendFlusher(
+        store, _post_to_backend, enabled=BACKEND_ENABLED, batch_size=FLUSH_BATCH_SIZE,
+    )
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
