@@ -8,6 +8,8 @@ ni de red (para poder testearla en cualquier plataforma).
   callable (`sender`), así el flusher no conoce aiohttp ni el endpoint.
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import sqlite3

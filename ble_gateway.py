@@ -5,6 +5,8 @@ Escanea dispositivos BLE con servicio Heart Rate, se conecta,
 guarda en SQLite + logger.txt, y opcionalmente reporta al backend.
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import sqlite3
