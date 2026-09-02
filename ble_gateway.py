@@ -219,33 +219,23 @@ def _es_nuestro_hr(device, adv) -> bool:
 
 
 async def _ubicar_wearable(want_address, timeout: int):
-    """Devuelve un BLEDevice con el scanner TODAVÍA corriendo (el context se
-    cierra afuera). En BlueZ, si el discovery se frena antes del Connect(), el
-    device se descarta y da `device 'dev_XX' not found`. Por eso se conecta con
-    el scanner vivo. `want_address` fija la dirección (modo TARGET_ADDRESSES);
-    si es None, matchea por Heart Rate Service + SCAN_NAME_FILTER."""
-    hallado: dict = {}
-    listo = asyncio.Event()
+    """Devuelve un BLEDevice listo para conectar.
 
-    def cb(device, adv):
-        if hallado:
-            return
-        if want_address:
-            if device.address.lower() != want_address.lower():
-                return
-        elif not _es_nuestro_hr(device, adv):
-            return
-        hallado["dev"] = device
-        listo.set()
-
-    scanner = BleakScanner(detection_callback=cb)
-    await scanner.start()
-    try:
-        await asyncio.wait_for(listo.wait(), timeout=timeout)
-    except asyncio.TimeoutError:
-        await scanner.stop()
+    Se usa BleakScanner.find_device_by_* (no discover()+connect a mano): bleak
+    maneja internamente el timing de frenar el discovery antes del Connect(),
+    que en BlueZ es delicado — con el scanner activo, Connect() se cancela
+    (`br-connection-canceled`); si se frena demasiado antes, el device se
+    descarta (`device 'dev_XX' not found`).
+    """
+    if want_address:
+        device = await BleakScanner.find_device_by_address(want_address, timeout=timeout)
+    else:
+        device = await BleakScanner.find_device_by_filter(
+            lambda d, adv: _es_nuestro_hr(d, adv), timeout=timeout
+        )
+    if device is None:
         raise RuntimeError("el wearable no apareció en el scan")
-    return scanner, hallado["dev"]
+    return device
 
 
 async def monitor_device(target, stop_event: asyncio.Event, store: HeartRateStore, flusher: BackendFlusher):
@@ -263,7 +253,7 @@ async def monitor_device(target, stop_event: asyncio.Event, store: HeartRateStor
     stuck_run = {"bpm": None, "count": 0, "reported": False}
 
     log.info("Buscando wearable%s...", f" {want_address}" if want_address else " (auto-scan)")
-    scanner, device = await _ubicar_wearable(want_address, SCAN_TIMEOUT)
+    device = await _ubicar_wearable(want_address, SCAN_TIMEOUT)
     address = device.address
 
     def on_hr(_sender, data: bytearray):
@@ -280,16 +270,13 @@ async def monitor_device(target, stop_event: asyncio.Event, store: HeartRateStor
             asyncio.create_task(report_connection_state(session, device_id, "DESCONECTADO"))
 
         log.info("Conectando a %s...", address)
-        try:
-            client = BleakClient(device, timeout=15, disconnected_callback=on_disconnect)
-            await client.__aenter__()
-        finally:
-            # ya conectados (o falló): el discovery ya no hace falta
-            await scanner.stop()
-        try:
+        async with BleakClient(device, timeout=15, disconnected_callback=on_disconnect) as client:
             log.info("Conectado a %s", address)
-            await report_connection_state(session, device_id, "CONECTADO")
+            # Suscribirse a las notificaciones ANTES de avisar al backend: el
+            # POST a Render puede tardar en frío y el wearable corta el link si
+            # nadie se suscribe en los primeros segundos.
             await client.start_notify(HR_CHAR_UUID, on_hr)
+            await report_connection_state(session, device_id, "CONECTADO")
 
             while not stop_event.is_set():
                 await asyncio.sleep(REPORT_INTERVAL)
@@ -331,11 +318,6 @@ async def monitor_device(target, stop_event: asyncio.Event, store: HeartRateStor
                         await flusher.flush(session)
                     else:
                         log.warning("[%s] Backend no disponible — reading en cola (id=%d)", address, row_id)
-        finally:
-            try:
-                await client.__aexit__(None, None, None)
-            except Exception:
-                pass
 
 
 async def monitor_loop(target, store: HeartRateStore, flusher: BackendFlusher, stop_event: asyncio.Event):
