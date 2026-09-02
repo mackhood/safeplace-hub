@@ -114,7 +114,10 @@ async def scan_for_hr_devices() -> list:
             log.info("Dispositivo HR ignorado por filtro de nombre: %s (%s)", address, name)
             continue
         log.info("Dispositivo HR encontrado: %s (%s)", address, name)
-        found.append(address)
+        # Se guarda el objeto BLEDevice (no la dirección): conectar por objeto
+        # del scan evita que BlueZ intente BR/EDR clásico
+        # (org.bluez.Error.Failed br-connection-profile-unavailable).
+        found.append(device)
 
     if not found:
         log.warning("No se encontró ningún dispositivo con servicio HR")
@@ -208,7 +211,11 @@ async def _post_to_backend(session: aiohttp.ClientSession, reading: HRReading) -
         return False
 
 
-async def monitor_device(address: str, stop_event: asyncio.Event, store: HeartRateStore, flusher: BackendFlusher):
+async def monitor_device(target, stop_event: asyncio.Event, store: HeartRateStore, flusher: BackendFlusher):
+    # `target` puede ser un BLEDevice (del scan) o una dirección (str, modo
+    # TARGET_ADDRESSES). Para bleak conviene el objeto; para logs/lookup, la
+    # dirección.
+    address = getattr(target, "address", target)
     latest_bpm: int | None = None
     estimator = estimator_from_env(os.environ)
 
@@ -232,7 +239,7 @@ async def monitor_device(address: str, stop_event: asyncio.Event, store: HeartRa
             asyncio.create_task(report_connection_state(session, device_id, "DESCONECTADO"))
 
         log.info("Conectando a %s...", address)
-        async with BleakClient(address, timeout=15, disconnected_callback=on_disconnect) as client:
+        async with BleakClient(target, timeout=15, disconnected_callback=on_disconnect) as client:
             log.info("Conectado a %s", address)
             await report_connection_state(session, device_id, "CONECTADO")
             await client.start_notify(HR_CHAR_UUID, on_hr)
@@ -279,11 +286,12 @@ async def monitor_device(address: str, stop_event: asyncio.Event, store: HeartRa
                         log.warning("[%s] Backend no disponible — reading en cola (id=%d)", address, row_id)
 
 
-async def monitor_loop(address: str, store: HeartRateStore, flusher: BackendFlusher, stop_event: asyncio.Event):
+async def monitor_loop(target, store: HeartRateStore, flusher: BackendFlusher, stop_event: asyncio.Event):
+    address = getattr(target, "address", target)
     while not stop_event.is_set():
         device_stop = asyncio.Event()
         try:
-            await monitor_device(address, device_stop, store, flusher)
+            await monitor_device(target, device_stop, store, flusher)
         except Exception as e:
             log.error("[%s] Error en monitor: %s", address, e)
 
@@ -318,7 +326,11 @@ async def run():
         store.close()
         return
 
-    log.info("Lanzando monitor para %d dispositivo(s): %s", len(addresses), addresses)
+    log.info(
+        "Lanzando monitor para %d dispositivo(s): %s",
+        len(addresses),
+        [getattr(a, "address", a) for a in addresses],
+    )
 
     tasks = [
         asyncio.create_task(monitor_loop(addr, store, flusher, stop_event))
