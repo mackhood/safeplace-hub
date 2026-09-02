@@ -357,8 +357,12 @@ async def monitor_loop(target, store: HeartRateStore, flusher: BackendFlusher, s
 async def run():
     stop_event = asyncio.Event()
     store = HeartRateStore(DB_PATH)
+    # Al arrancar, dar por perdido lo que quedó en el buffer y ya está más
+    # viejo que BUFFER_TTL: reenviarlo solo genera 409 DUPLICADO auditados.
+    store.purge_stale(BUFFER_TTL)
     flusher = BackendFlusher(
-        store, _post_to_backend, enabled=BACKEND_ENABLED, batch_size=FLUSH_BATCH_SIZE,
+        store, _post_to_backend, enabled=BACKEND_ENABLED,
+        batch_size=FLUSH_BATCH_SIZE, ttl_seconds=BUFFER_TTL,
     )
 
     loop = asyncio.get_running_loop()

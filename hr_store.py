@@ -3,7 +3,8 @@ Capa de persistencia y cola de reenvío del gateway — sin dependencias de BLE
 ni de red (para poder testearla en cualquier plataforma).
 
 - `HeartRateStore`: SQLite. Todo reading se guarda; `sent=0` = pendiente de
-  enviar al backend, `sent=1` = ya enviado. Nunca se borra nada.
+  enviar al backend, `sent=1` = ya enviado, `sent=2` = descartado por TTL
+  (más viejo que BUFFER_TTL sin poder enviarse). Nunca se borra una fila.
 - `BackendFlusher`: usa la tabla como cola. El envío real se inyecta como
   callable (`sender`), así el flusher no conoce aiohttp ni el endpoint.
 """
@@ -81,6 +82,26 @@ class HeartRateStore:
             (limit,),
         ).fetchall()
 
+    def purge_stale(self, ttl_seconds: int) -> int:
+        """Marca (sent=2) las lecturas pendientes más viejas que `ttl_seconds`.
+
+        Sin esto, el buffer offline crece sin límite y reenvía lecturas de
+        hace días en cada reinicio del gateway — el backend las deduplica pero
+        quedan auditadas como descarte. `BUFFER_TTL` (default 2 h) acota cuánto
+        tiene sentido reintentar un tramo caído antes de darlo por perdido.
+        """
+        if ttl_seconds <= 0:
+            return 0
+        cur = self._conn.execute(
+            "UPDATE heart_rate_log SET sent=2 "
+            "WHERE sent=0 AND created_at < strftime('%s','now') - ?",
+            (ttl_seconds,),
+        )
+        self._conn.commit()
+        if cur.rowcount:
+            log.info("Buffer: %d lectura(s) pendiente(s) descartada(s) por TTL (%ds)", cur.rowcount, ttl_seconds)
+        return cur.rowcount
+
     def close(self):
         self._conn.close()
 
@@ -96,11 +117,12 @@ class BackendFlusher:
     """
 
     def __init__(self, store: HeartRateStore, sender, *, enabled: bool = True,
-                 batch_size: int = DEFAULT_BATCH_SIZE):
+                 batch_size: int = DEFAULT_BATCH_SIZE, ttl_seconds: int = 0):
         self._store = store
         self._sender = sender
         self._enabled = enabled
         self._batch_size = batch_size
+        self._ttl_seconds = ttl_seconds
         self._lock = asyncio.Lock()
 
     async def flush(self, session) -> int:
@@ -108,6 +130,7 @@ class BackendFlusher:
             return 0
 
         async with self._lock:
+            self._store.purge_stale(self._ttl_seconds)
             total_sent = 0
             while True:
                 batch = self._store.fetch_unsent(self._batch_size)

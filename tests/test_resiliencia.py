@@ -113,6 +113,39 @@ async def test_flush_desactivado_no_hace_nada(store):
     assert len(_pendientes(store)) == 1
 
 
+def test_purge_stale_descarta_pendientes_viejas(store):
+    store.save(_reading(80, 1000))
+    store.save(_reading(81, 1001))
+    # Envejecer una de las dos por debajo del TTL.
+    store._conn.execute(
+        "UPDATE heart_rate_log SET created_at = strftime('%s','now') - 9999 WHERE bpm = 80"
+    )
+    store._conn.commit()
+
+    descartadas = store.purge_stale(ttl_seconds=3600)
+    assert descartadas == 1
+    pendientes = _pendientes(store)
+    assert len(pendientes) == 1
+    assert pendientes[0][1] == 81  # la reciente sigue pendiente
+
+    # ttl<=0 => no-op
+    assert store.purge_stale(ttl_seconds=0) == 0
+
+
+@pytest.mark.asyncio
+async def test_flush_purga_antes_de_reenviar(store):
+    store.save(_reading(70, 2000))
+    store._conn.execute(
+        "UPDATE heart_rate_log SET created_at = strftime('%s','now') - 9999"
+    )
+    store._conn.commit()
+
+    flusher = BackendFlusher(store, _sender_ok(), enabled=True, ttl_seconds=3600)
+    enviados = await flusher.flush(session=None)
+    assert enviados == 0
+    assert len(_pendientes(store)) == 0
+
+
 def test_persistencia_sobrevive_reinicio_del_proceso(tmp_path):
     db = str(tmp_path / "safeplace.db")
     s1 = HeartRateStore(db_path=db)
