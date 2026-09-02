@@ -23,6 +23,23 @@ import aiohttp
 from activity import estimator_from_env
 from hr_store import HRReading, HeartRateStore, BackendFlusher
 
+# ─── .env ─────────────────────────────────────────────────────────────
+# `python ble_gateway.py` a mano tiene que ver la misma config que el
+# servicio systemd (que la inyecta con EnvironmentFile). Cargamos el .env
+# que esté al lado del script; no pisa nada que ya venga del entorno.
+def _load_dotenv(path: Path) -> None:
+    if not path.is_file():
+        return
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+
+
+_load_dotenv(Path(__file__).with_name(".env"))
+
 # ─── Config ───────────────────────────────────────────────────────────
 
 # BACKEND_URL es la base del backend real de SafePlace (ej. http://host:8000,
@@ -102,6 +119,9 @@ def parse_hr(data: bytearray) -> int:
 async def scan_for_hr_devices() -> list:
     log.info("Escaneando dispositivos BLE (timeout=%ds)...", SCAN_TIMEOUT)
     devices = await BleakScanner.discover(timeout=SCAN_TIMEOUT, return_adv=True)
+    # BlueZ tarda un instante en salir del estado "Discovering" después de que
+    # discover() retorna; conectar antes de eso da org.bluez.Error.InProgress.
+    await asyncio.sleep(2)
     found = []
 
     for address, (device, adv) in devices.items():
@@ -292,6 +312,30 @@ async def monitor_device(target, stop_event: asyncio.Event, store: HeartRateStor
                         log.warning("[%s] Backend no disponible — reading en cola (id=%d)", address, row_id)
 
 
+async def _redescubrir(target, address):
+    """Handle BLE fresco tras una desconexión.
+
+    El BLEDevice que devolvió el scan original se invalida cuando BlueZ lo
+    saca de su caché (típico tras un fallo de conexión) o cuando un simulador
+    CoreBluetooth rota su dirección aleatoria al reiniciarse. Reusar el objeto
+    viejo da `device '...' not found` en loop. En modo TARGET_ADDRESSES el
+    target es un str y siempre se conecta por dirección, así que no se toca.
+    """
+    if isinstance(target, str):
+        return target, address
+    encontrados = await scan_for_hr_devices()
+    for d in encontrados:
+        if getattr(d, "address", None) == address:
+            return d, address
+    if encontrados:
+        nuevo = encontrados[0]
+        addr = getattr(nuevo, "address", nuevo)
+        log.info("[%s] Redescubierto con nueva dirección: %s", address, addr)
+        return nuevo, addr
+    log.warning("[%s] No se pudo redescubrir; se reintenta con el handle viejo", address)
+    return target, address
+
+
 async def monitor_loop(target, store: HeartRateStore, flusher: BackendFlusher, stop_event: asyncio.Event):
     address = getattr(target, "address", target)
     while not stop_event.is_set():
@@ -306,6 +350,7 @@ async def monitor_loop(target, store: HeartRateStore, flusher: BackendFlusher, s
 
         log.info("[%s] Reconectando en %ds...", address, RECONNECT_DELAY)
         await asyncio.sleep(RECONNECT_DELAY)
+        target, address = await _redescubrir(target, address)
 
 
 async def run():
