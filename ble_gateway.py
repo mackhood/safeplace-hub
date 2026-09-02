@@ -201,7 +201,13 @@ async def _post_to_backend(session: aiohttp.ClientSession, reading: HRReading) -
     try:
         async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status < 300:
-                log.debug("Backend OK: %d BPM → HTTP %d", reading.bpm, resp.status)
+                log.info("[%s] Backend OK: %d BPM (HTTP %d)", reading.device_address, reading.bpm, resp.status)
+                return True
+            # 409 DUPLICADO = la medición ya está persistida (reintento del
+            # backlog, o reinicio del proceso entre el envío y el mark_sent).
+            # Se trata como éxito para que salga de la cola y no se reintente.
+            if resp.status == 409:
+                log.debug("[%s] Backend 409 (duplicado, ya persistida) — se marca enviada", reading.device_address)
                 return True
             body = await resp.text()
             log.warning("Backend HTTP %d: %s", resp.status, body[:200])
