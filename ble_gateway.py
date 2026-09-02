@@ -47,6 +47,12 @@ REPORT_INTERVAL  = int(os.getenv("REPORT_INTERVAL", "5"))
 FORCE_DEVICE_ID  = os.getenv("FORCE_DEVICE_ID", "").strip()
 FORCE_DEVICE_ID  = int(FORCE_DEVICE_ID) if FORCE_DEVICE_ID.isdigit() else None
 
+# Filtro de nombre para el auto-scan: si está seteado, el hub solo se conecta a
+# dispositivos cuyo nombre BLE contenga este texto (case-insensitive). Evita
+# engancharse a un wearable ajeno (otro reloj / banda) que también exponga el
+# Heart Rate Service. Ej: SCAN_NAME_FILTER=SafePlace-Sim
+SCAN_NAME_FILTER = os.getenv("SCAN_NAME_FILTER", "").strip().lower()
+
 # CP-E2E-04: N lecturas seguidas con EXACTAMENTE la misma pulsación => el
 # wearable no está midiendo de verdad (fuera de la muñeca) y se reporta
 # DESCONECTADO. A REPORT_INTERVAL=5s, 12 ≈ 1 min de pulso congelado.
@@ -100,11 +106,15 @@ async def scan_for_hr_devices() -> list:
 
     for address, (device, adv) in devices.items():
         uuids = [str(u).lower() for u in adv.service_uuids]
-        name = device.name or "sin nombre"
+        name = device.name or adv.local_name or "sin nombre"
         log.debug("  %s | %s | UUIDs: %s", address, name, uuids)
-        if HR_SERVICE_UUID in uuids:
-            log.info("Dispositivo HR encontrado: %s (%s)", address, name)
-            found.append(address)
+        if HR_SERVICE_UUID not in uuids:
+            continue
+        if SCAN_NAME_FILTER and SCAN_NAME_FILTER not in name.lower():
+            log.info("Dispositivo HR ignorado por filtro de nombre: %s (%s)", address, name)
+            continue
+        log.info("Dispositivo HR encontrado: %s (%s)", address, name)
+        found.append(address)
 
     if not found:
         log.warning("No se encontró ningún dispositivo con servicio HR")
