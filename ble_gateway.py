@@ -116,36 +116,6 @@ def parse_hr(data: bytearray) -> int:
     return data[1]
 
 
-async def scan_for_hr_devices() -> list:
-    log.info("Escaneando dispositivos BLE (timeout=%ds)...", SCAN_TIMEOUT)
-    devices = await BleakScanner.discover(timeout=SCAN_TIMEOUT, return_adv=True)
-    # BlueZ tarda un instante en salir del estado "Discovering" después de que
-    # discover() retorna; conectar antes de eso da org.bluez.Error.InProgress.
-    await asyncio.sleep(2)
-    found = []
-
-    for address, (device, adv) in devices.items():
-        uuids = [str(u).lower() for u in adv.service_uuids]
-        name = device.name or adv.local_name or "sin nombre"
-        log.debug("  %s | %s | UUIDs: %s", address, name, uuids)
-        if HR_SERVICE_UUID not in uuids:
-            continue
-        if SCAN_NAME_FILTER and SCAN_NAME_FILTER not in name.lower():
-            log.info("Dispositivo HR ignorado por filtro de nombre: %s (%s)", address, name)
-            continue
-        log.info("Dispositivo HR encontrado: %s (%s)", address, name)
-        # Se guarda el objeto BLEDevice (no la dirección): conectar por objeto
-        # del scan evita que BlueZ intente BR/EDR clásico
-        # (org.bluez.Error.Failed br-connection-profile-unavailable).
-        found.append(device)
-
-    if not found:
-        log.warning("No se encontró ningún dispositivo con servicio HR")
-    else:
-        log.info("Total dispositivos HR: %d", len(found))
-    return found
-
-
 # MAC BLE -> id numérico de dispositivo en el backend (H0007). El backend
 # identifica todo por id, no por MAC; se resuelve una vez por dirección
 # (con reintento si todavía no está registrada) y se cachea en memoria.
@@ -237,11 +207,52 @@ async def _post_to_backend(session: aiohttp.ClientSession, reading: HRReading) -
         return False
 
 
+def _es_nuestro_hr(device, adv) -> bool:
+    uuids = [str(u).lower() for u in adv.service_uuids]
+    if HR_SERVICE_UUID not in uuids:
+        return False
+    if SCAN_NAME_FILTER:
+        name = (device.name or adv.local_name or "").lower()
+        if SCAN_NAME_FILTER not in name:
+            return False
+    return True
+
+
+async def _ubicar_wearable(want_address, timeout: int):
+    """Devuelve un BLEDevice con el scanner TODAVÍA corriendo (el context se
+    cierra afuera). En BlueZ, si el discovery se frena antes del Connect(), el
+    device se descarta y da `device 'dev_XX' not found`. Por eso se conecta con
+    el scanner vivo. `want_address` fija la dirección (modo TARGET_ADDRESSES);
+    si es None, matchea por Heart Rate Service + SCAN_NAME_FILTER."""
+    hallado: dict = {}
+    listo = asyncio.Event()
+
+    def cb(device, adv):
+        if hallado:
+            return
+        if want_address:
+            if device.address.lower() != want_address.lower():
+                return
+        elif not _es_nuestro_hr(device, adv):
+            return
+        hallado["dev"] = device
+        listo.set()
+
+    scanner = BleakScanner(detection_callback=cb)
+    await scanner.start()
+    try:
+        await asyncio.wait_for(listo.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        await scanner.stop()
+        raise RuntimeError("el wearable no apareció en el scan")
+    return scanner, hallado["dev"]
+
+
 async def monitor_device(target, stop_event: asyncio.Event, store: HeartRateStore, flusher: BackendFlusher):
-    # `target` puede ser un BLEDevice (del scan) o una dirección (str, modo
-    # TARGET_ADDRESSES). Para bleak conviene el objeto; para logs/lookup, la
-    # dirección.
-    address = getattr(target, "address", target)
+    # `target` puede ser una dirección (str, modo TARGET_ADDRESSES) o None
+    # (auto-scan). Si viene un BLEDevice, sólo se usa su dirección como pista;
+    # el device se relocaliza fresco en cada intento.
+    want_address = target if isinstance(target, str) else None
     latest_bpm: int | None = None
     estimator = estimator_from_env(os.environ)
 
@@ -250,6 +261,10 @@ async def monitor_device(target, stop_event: asyncio.Event, store: HeartRateStor
     # (fuera de la muñeca) — se reporta DESCONECTADO y se dejan de enviar
     # mediciones hasta que llegue un valor genuinamente distinto.
     stuck_run = {"bpm": None, "count": 0, "reported": False}
+
+    log.info("Buscando wearable%s...", f" {want_address}" if want_address else " (auto-scan)")
+    scanner, device = await _ubicar_wearable(want_address, SCAN_TIMEOUT)
+    address = device.address
 
     def on_hr(_sender, data: bytearray):
         nonlocal latest_bpm
@@ -265,7 +280,13 @@ async def monitor_device(target, stop_event: asyncio.Event, store: HeartRateStor
             asyncio.create_task(report_connection_state(session, device_id, "DESCONECTADO"))
 
         log.info("Conectando a %s...", address)
-        async with BleakClient(target, timeout=15, disconnected_callback=on_disconnect) as client:
+        try:
+            client = BleakClient(device, timeout=15, disconnected_callback=on_disconnect)
+            await client.__aenter__()
+        finally:
+            # ya conectados (o falló): el discovery ya no hace falta
+            await scanner.stop()
+        try:
             log.info("Conectado a %s", address)
             await report_connection_state(session, device_id, "CONECTADO")
             await client.start_notify(HR_CHAR_UUID, on_hr)
@@ -310,34 +331,15 @@ async def monitor_device(target, stop_event: asyncio.Event, store: HeartRateStor
                         await flusher.flush(session)
                     else:
                         log.warning("[%s] Backend no disponible — reading en cola (id=%d)", address, row_id)
-
-
-async def _redescubrir(target, address):
-    """Handle BLE fresco tras una desconexión.
-
-    El BLEDevice que devolvió el scan original se invalida cuando BlueZ lo
-    saca de su caché (típico tras un fallo de conexión) o cuando un simulador
-    CoreBluetooth rota su dirección aleatoria al reiniciarse. Reusar el objeto
-    viejo da `device '...' not found` en loop. En modo TARGET_ADDRESSES el
-    target es un str y siempre se conecta por dirección, así que no se toca.
-    """
-    if isinstance(target, str):
-        return target, address
-    encontrados = await scan_for_hr_devices()
-    for d in encontrados:
-        if getattr(d, "address", None) == address:
-            return d, address
-    if encontrados:
-        nuevo = encontrados[0]
-        addr = getattr(nuevo, "address", nuevo)
-        log.info("[%s] Redescubierto con nueva dirección: %s", address, addr)
-        return nuevo, addr
-    log.warning("[%s] No se pudo redescubrir; se reintenta con el handle viejo", address)
-    return target, address
+        finally:
+            try:
+                await client.__aexit__(None, None, None)
+            except Exception:
+                pass
 
 
 async def monitor_loop(target, store: HeartRateStore, flusher: BackendFlusher, stop_event: asyncio.Event):
-    address = getattr(target, "address", target)
+    address = getattr(target, "address", target) or "auto-scan"
     while not stop_event.is_set():
         device_stop = asyncio.Event()
         try:
@@ -350,7 +352,6 @@ async def monitor_loop(target, store: HeartRateStore, flusher: BackendFlusher, s
 
         log.info("[%s] Reconectando en %ds...", address, RECONNECT_DELAY)
         await asyncio.sleep(RECONNECT_DELAY)
-        target, address = await _redescubrir(target, address)
 
 
 async def run():
@@ -364,28 +365,21 @@ async def run():
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop_event.set)
 
-    addresses = list(TARGET_ADDRESSES)
-    if not addresses:
-        while not stop_event.is_set():
-            addresses = await scan_for_hr_devices()
-            if addresses:
-                break
-            log.info("Reintentando scan en %ds...", RECONNECT_DELAY)
-            await asyncio.sleep(RECONNECT_DELAY)
-
-    if stop_event.is_set():
-        store.close()
-        return
+    # Modo TARGET_ADDRESSES: un monitor por dirección fija. Auto-scan: un solo
+    # monitor que localiza el wearable por HR Service + SCAN_NAME_FILTER en cada
+    # intento (el scan+conexión viven dentro de monitor_device para que BlueZ no
+    # descarte el device entre discover() y Connect()).
+    targets = list(TARGET_ADDRESSES) if TARGET_ADDRESSES else [None]
 
     log.info(
-        "Lanzando monitor para %d dispositivo(s): %s",
-        len(addresses),
-        [getattr(a, "address", a) for a in addresses],
+        "Lanzando %d monitor(es): %s",
+        len(targets),
+        [t or "auto-scan" for t in targets],
     )
 
     tasks = [
-        asyncio.create_task(monitor_loop(addr, store, flusher, stop_event))
-        for addr in addresses
+        asyncio.create_task(monitor_loop(t, store, flusher, stop_event))
+        for t in targets
     ]
 
     await stop_event.wait()
