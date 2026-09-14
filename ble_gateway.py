@@ -248,9 +248,12 @@ async def monitor_device(target, stop_event: asyncio.Event, store: HeartRateStor
 
     # CP-E2E-04: si el wearable repite exactamente la misma pulsación
     # STUCK_READINGS_THRESHOLD veces seguidas, no está midiendo de verdad
-    # (fuera de la muñeca) — se reporta DESCONECTADO y se dejan de enviar
-    # mediciones hasta que llegue un valor genuinamente distinto.
-    stuck_run = {"bpm": None, "count": 0, "reported": False}
+    # (fuera de la muñeca) — se reporta DESCONECTADO y se corta la sesión BLE.
+    # Un wearable real fuera de la muñeca deja de emitir; el simulador en
+    # cambio solo puede "congelar" el último valor cuando termina un
+    # escenario, así que sin este corte el hub se queda esperando para
+    # siempre un valor que ya no va a cambiar y nunca vuelve a escanear.
+    stuck_run = {"bpm": None, "count": 0}
 
     log.info("Buscando wearable%s...", f" {want_address}" if want_address else " (auto-scan)")
     device = await _ubicar_wearable(want_address, SCAN_TIMEOUT)
@@ -288,20 +291,21 @@ async def monitor_device(target, stop_event: asyncio.Event, store: HeartRateStor
                 if latest_bpm == stuck_run["bpm"]:
                     stuck_run["count"] += 1
                 else:
-                    if stuck_run["reported"]:
-                        log.info("[%s] Pulso vuelve a variar (%d BPM) — CONECTADO", address, latest_bpm)
-                        await report_connection_state(session, device_id, "CONECTADO")
-                    stuck_run.update(bpm=latest_bpm, count=1, reported=False)
+                    stuck_run.update(bpm=latest_bpm, count=1)
 
                 if stuck_run["count"] >= STUCK_READINGS_THRESHOLD:
-                    if not stuck_run["reported"]:
-                        log.warning(
-                            "[%s] %d lecturas iguales seguidas (%d BPM) — se reporta DESCONECTADO",
-                            address, stuck_run["count"], latest_bpm,
-                        )
-                        await report_connection_state(session, device_id, "DESCONECTADO")
-                        stuck_run["reported"] = True
-                    continue  # no se guarda ni se envía un pulso congelado
+                    log.warning(
+                        "[%s] %d lecturas iguales seguidas (%d BPM) — se reporta DESCONECTADO y se corta la sesión",
+                        address, stuck_run["count"], latest_bpm,
+                    )
+                    await report_connection_state(session, device_id, "DESCONECTADO")
+                    # Cortar acá (no solo marcar) es lo que hace que monitor_loop
+                    # vuelva a "Buscando wearable..." en vez de quedarse
+                    # conectado sin novedades. Si el wearable sigue congelado,
+                    # el próximo intento vuelve a detectarlo y a cortar; si
+                    # arrancó un escenario nuevo, engancha ahí.
+                    stop_event.set()
+                    break
 
                 actividad = estimator.update(latest_bpm)
                 reading = HRReading(
