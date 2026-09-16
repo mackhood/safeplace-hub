@@ -8,8 +8,10 @@ guarda en SQLite + logger.txt, y opcionalmente reporta al backend.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import logging
 import sqlite3
+import sys
 import time
 import os
 import signal
@@ -382,7 +384,35 @@ async def run():
     log.info("Gateway detenido")
 
 
+_LOCK_PATH = Path.home() / ".safeplace-gateway.lock"
+_lock_file = None  # referencia global: si se cierra, el flock se libera
+
+
+def _tomar_lock_instancia_unica():
+    """Evita que dos instalaciones del gateway (ej. ~/safeplace-hub y la
+    vieja ~/safeplace-gateway del servicio systemd) se conecten al mismo
+    wearable a la vez: ambas reciben cada notificación BLE y cada una la
+    guarda y la manda al backend por su cuenta, duplicando mediciones y
+    pisándose los reportes de estado CONECTADO/DESCONECTADO. El lock es un
+    archivo fijo en el home (no depende de desde qué carpeta se corre)."""
+    global _lock_file
+    _lock_file = open(_LOCK_PATH, "w")
+    try:
+        fcntl.flock(_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log.error(
+            "Ya hay otra instancia de ble_gateway.py corriendo (lock %s). "
+            "Si es el servicio systemd viejo: sudo systemctl stop safeplace-gateway "
+            "&& sudo systemctl disable safeplace-gateway. Saliendo.",
+            _LOCK_PATH,
+        )
+        sys.exit(1)
+    _lock_file.write(str(os.getpid()))
+    _lock_file.flush()
+
+
 def main():
+    _tomar_lock_instancia_unica()
     log.info("=== SafePlace BLE Gateway ===")
     log.info("Backend: %s", BACKEND_URL if BACKEND_ENABLED else "DESACTIVADO (se activa poniendo BACKEND_URL en .env)")
     log.info("SQLite:  %s", DB_PATH)
