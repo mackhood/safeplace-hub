@@ -310,13 +310,30 @@ async def monitor_device(address: str, stop_event: asyncio.Event, store: HeartRa
     async with aiohttp.ClientSession() as session:
         device_id = await resolve_device_id(session, address)
 
+        # BlueZ puede reintentar el establecimiento del enlace LE varias
+        # veces dentro de una sola llamada a connect() cuando la radio
+        # falla (visto en captura btmon: "Connection Failed to be
+        # Established", cada ~0.4s), y bleak dispara disconnected_callback
+        # en cada intento fallido — ANTES de que la conexión real haya
+        # terminado de establecerse. Sin esta guarda, stop_event quedaba
+        # en true desde antes de conectar, y la conexión que sí llegaba a
+        # establecerse se cortaba sola al toque en la primera vuelta del
+        # while de abajo.
+        conectado = False
+        reportado_desconexion = False
+
         def on_disconnect(_client):
+            nonlocal reportado_desconexion
+            if not conectado or reportado_desconexion:
+                return
+            reportado_desconexion = True
             log.warning("[%s] Dispositivo desconectado", address)
             stop_event.set()
             asyncio.create_task(report_connection_state(session, device_id, "DESCONECTADO"))
 
         log.info("Conectando a %s...", address)
         async with BleakClient(address, timeout=15, disconnected_callback=on_disconnect) as client:
+            conectado = True
             log.info("Conectado a %s", address)
             await report_connection_state(session, device_id, "CONECTADO")
             await client.start_notify(HR_CHAR_UUID, on_hr)
