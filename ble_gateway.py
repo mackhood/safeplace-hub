@@ -78,6 +78,9 @@ SCAN_NAME_FILTER = os.getenv("SCAN_NAME_FILTER", "").strip().lower()
 STUCK_READINGS_THRESHOLD = int(os.getenv("STUCK_READINGS_THRESHOLD", "12"))
 BUFFER_TTL       = int(os.getenv("BUFFER_TTL", "7200"))
 FLUSH_BATCH_SIZE = int(os.getenv("FLUSH_BATCH_SIZE", "50"))
+# Cada cuánto se reconfirma "CONECTADO" al backend mientras el wearable siga
+# mandando datos frescos — ver comentario en monitor_device.
+REINTENTO_ESTADO_SEGUNDOS = int(os.getenv("REINTENTO_ESTADO_SEGUNDOS", "60"))
 
 DB_PATH      = os.getenv("DB_PATH", str(Path.home() / "safeplace-gateway" / "safeplace.db"))
 LOG_FILE_PATH = os.getenv("LOG_FILE_PATH", str(Path.home() / "safeplace-gateway" / "logger.txt"))
@@ -282,12 +285,23 @@ async def monitor_device(target, stop_event: asyncio.Event, store: HeartRateStor
             # nadie se suscribe en los primeros segundos.
             await client.start_notify(HR_CHAR_UUID, on_hr)
             await report_connection_state(session, device_id, "CONECTADO")
+            # report_connection_state es un POST suelto, sin buffer ni reintento
+            # (a diferencia de las mediciones): si se pierde por un hiccup de
+            # red puntual, el backend queda pensando "desconectado" para
+            # siempre aunque el wearable siga mandando datos reales. Reconfirmar
+            # CONECTADO cada REINTENTO_ESTADO_SEGUNDOS mientras haya datos
+            # frescos hace que un reporte perdido se autocorrija solo.
+            ultimo_reporte_estado = time.monotonic()
 
             while not stop_event.is_set():
                 await asyncio.sleep(REPORT_INTERVAL)
 
                 if latest_bpm is None:
                     continue
+
+                if time.monotonic() - ultimo_reporte_estado >= REINTENTO_ESTADO_SEGUNDOS:
+                    await report_connection_state(session, device_id, "CONECTADO")
+                    ultimo_reporte_estado = time.monotonic()
 
                 # --- Detección de pulso "congelado" ---
                 if latest_bpm == stuck_run["bpm"]:
