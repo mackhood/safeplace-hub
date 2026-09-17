@@ -45,6 +45,12 @@ STUCK_READINGS_THRESHOLD = int(os.getenv("STUCK_READINGS_THRESHOLD", "12"))
 BUFFER_TTL       = int(os.getenv("BUFFER_TTL", "7200"))
 FLUSH_BATCH_SIZE = int(os.getenv("FLUSH_BATCH_SIZE", "50"))
 
+# La mayoría de los intentos fallidos agotan el timeout completo antes de
+# reportar el error (visto en logs: ~15s por intento fallido) — bajarlo
+# acelera todo el ciclo de reintento sin perder los reconnects rápidos
+# (los que sí sirven suelen tardar 4-8s, no 15).
+CONNECT_TIMEOUT_SEGUNDOS = int(os.getenv("CONNECT_TIMEOUT_SEGUNDOS", "8"))
+
 # Watchdog de recuperación automática (self-healing) para cuando el hub
 # queda "trabado": un caché de GATT desincronizado en BlueZ produce el
 # mismo error de conexión una y otra vez ("failed to discover services,
@@ -53,8 +59,8 @@ FLUSH_BATCH_SIZE = int(os.getenv("FLUSH_BATCH_SIZE", "50"))
 # alcanza, se escala a reiniciar el propio servicio bluetooth (requiere
 # sudoers NOPASSWD para systemctl restart bluetooth en el hub).
 STALE_CONNECTION_TIMEOUT = int(os.getenv("STALE_CONNECTION_TIMEOUT", "30"))
-RESET_CACHE_AFTER_FAILURES = int(os.getenv("RESET_CACHE_AFTER_FAILURES", "2"))
-RESTART_BLUETOOTH_AFTER_FAILURES = int(os.getenv("RESTART_BLUETOOTH_AFTER_FAILURES", "5"))
+RESET_CACHE_AFTER_FAILURES = int(os.getenv("RESET_CACHE_AFTER_FAILURES", "1"))
+RESTART_BLUETOOTH_AFTER_FAILURES = int(os.getenv("RESTART_BLUETOOTH_AFTER_FAILURES", "3"))
 
 DB_PATH      = os.getenv("DB_PATH", str(Path.home() / "safeplace-gateway" / "safeplace.db"))
 LOG_FILE_PATH = os.getenv("LOG_FILE_PATH", str(Path.home() / "safeplace-gateway" / "logger.txt"))
@@ -375,7 +381,7 @@ async def monitor_device(address: str, stop_event: asyncio.Event, store: HeartRa
             asyncio.create_task(report_connection_state(session, device_id, "DESCONECTADO"))
 
         log.info("Conectando a %s...", address)
-        async with BleakClient(address, timeout=15, disconnected_callback=on_disconnect) as client:
+        async with BleakClient(address, timeout=CONNECT_TIMEOUT_SEGUNDOS, disconnected_callback=on_disconnect) as client:
             conectado = True
             last_notification_ts = time.time()
             log.info("Conectado a %s", address)
