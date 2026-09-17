@@ -41,7 +41,7 @@ REPORT_INTERVAL  = int(os.getenv("REPORT_INTERVAL", "5"))
 # CP-E2E-04: N lecturas seguidas con EXACTAMENTE la misma pulsación => el
 # wearable no está midiendo de verdad (fuera de la muñeca) y se reporta
 # DESCONECTADO. A REPORT_INTERVAL=5s, 12 ≈ 1 min de pulso congelado.
-STUCK_READINGS_THRESHOLD = int(os.getenv("STUCK_READINGS_THRESHOLD", "12"))
+STUCK_READINGS_THRESHOLD = int(os.getenv("STUCK_READINGS_THRESHOLD", "2"))
 BUFFER_TTL       = int(os.getenv("BUFFER_TTL", "7200"))
 FLUSH_BATCH_SIZE = int(os.getenv("FLUSH_BATCH_SIZE", "50"))
 
