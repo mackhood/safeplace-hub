@@ -58,7 +58,7 @@ CONNECT_TIMEOUT_SEGUNDOS = int(os.getenv("CONNECT_TIMEOUT_SEGUNDOS", "8"))
 # remove <mac>` lo destraba forzando un descubrimiento limpio. Si eso no
 # alcanza, se escala a reiniciar el propio servicio bluetooth (requiere
 # sudoers NOPASSWD para systemctl restart bluetooth en el hub).
-STALE_CONNECTION_TIMEOUT = int(os.getenv("STALE_CONNECTION_TIMEOUT", "30"))
+STALE_CONNECTION_TIMEOUT = int(os.getenv("STALE_CONNECTION_TIMEOUT", "10"))
 RESET_CACHE_AFTER_FAILURES = int(os.getenv("RESET_CACHE_AFTER_FAILURES", "1"))
 RESTART_BLUETOOTH_AFTER_FAILURES = int(os.getenv("RESTART_BLUETOOTH_AFTER_FAILURES", "3"))
 
