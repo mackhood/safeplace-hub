@@ -45,6 +45,17 @@ STUCK_READINGS_THRESHOLD = int(os.getenv("STUCK_READINGS_THRESHOLD", "12"))
 BUFFER_TTL       = int(os.getenv("BUFFER_TTL", "7200"))
 FLUSH_BATCH_SIZE = int(os.getenv("FLUSH_BATCH_SIZE", "50"))
 
+# Watchdog de recuperación automática (self-healing) para cuando el hub
+# queda "trabado": un caché de GATT desincronizado en BlueZ produce el
+# mismo error de conexión una y otra vez ("failed to discover services,
+# device disconnected"), visto en vivo el 2026-09-16 — `bluetoothctl
+# remove <mac>` lo destraba forzando un descubrimiento limpio. Si eso no
+# alcanza, se escala a reiniciar el propio servicio bluetooth (requiere
+# sudoers NOPASSWD para systemctl restart bluetooth en el hub).
+STALE_CONNECTION_TIMEOUT = int(os.getenv("STALE_CONNECTION_TIMEOUT", "30"))
+RESET_CACHE_AFTER_FAILURES = int(os.getenv("RESET_CACHE_AFTER_FAILURES", "2"))
+RESTART_BLUETOOTH_AFTER_FAILURES = int(os.getenv("RESTART_BLUETOOTH_AFTER_FAILURES", "5"))
+
 DB_PATH      = os.getenv("DB_PATH", str(Path.home() / "safeplace-gateway" / "safeplace.db"))
 LOG_FILE_PATH = os.getenv("LOG_FILE_PATH", str(Path.home() / "safeplace-gateway" / "logger.txt"))
 
@@ -292,8 +303,39 @@ async def _post_to_backend(session: aiohttp.ClientSession, reading: HRReading) -
         return False
 
 
-async def monitor_device(address: str, stop_event: asyncio.Event, store: HeartRateStore, flusher: BackendFlusher):
+async def clear_ble_cache(address: str):
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "bluetoothctl", "remove", address,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+        log.warning("[%s] Caché GATT de BlueZ limpiado (bluetoothctl remove)", address)
+    except Exception as e:
+        log.error("[%s] No se pudo limpiar el caché BLE: %s", address, e)
+
+
+async def restart_bluetooth_stack():
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "sudo", "systemctl", "restart", "bluetooth",
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+        log.warning("Servicio bluetooth reiniciado (systemctl restart bluetooth)")
+        await asyncio.sleep(3)
+    except Exception as e:
+        log.error("No se pudo reiniciar el servicio bluetooth: %s", e)
+
+
+async def monitor_device(address: str, stop_event: asyncio.Event, store: HeartRateStore, flusher: BackendFlusher) -> bool:
+    """Devuelve True si en este intento llegó a fluir al menos un dato real
+    del wearable (aunque después se haya cortado la conexión), False si el
+    intento no sirvió para nada (nunca conectó, o conectó pero quedó
+    "zombie" sin tráfico real) — es la señal que usa monitor_loop para
+    decidir si escalar la recuperación automática."""
     latest_bpm: int | None = None
+    last_notification_ts = time.time()
     estimator = estimator_from_env(os.environ)
 
     # CP-E2E-04: si el wearable repite exactamente la misma pulsación
@@ -303,8 +345,9 @@ async def monitor_device(address: str, stop_event: asyncio.Event, store: HeartRa
     stuck_run = {"bpm": None, "count": 0, "reported": False}
 
     def on_hr(_sender, data: bytearray):
-        nonlocal latest_bpm
+        nonlocal latest_bpm, last_notification_ts
         latest_bpm = parse_hr(data)
+        last_notification_ts = time.time()
         log.info("[%s] HR: %d BPM", address, latest_bpm)
 
     async with aiohttp.ClientSession() as session:
@@ -334,12 +377,26 @@ async def monitor_device(address: str, stop_event: asyncio.Event, store: HeartRa
         log.info("Conectando a %s...", address)
         async with BleakClient(address, timeout=15, disconnected_callback=on_disconnect) as client:
             conectado = True
+            last_notification_ts = time.time()
             log.info("Conectado a %s", address)
             await report_connection_state(session, device_id, "CONECTADO")
             await client.start_notify(HR_CHAR_UUID, on_hr)
 
             while not stop_event.is_set():
                 await asyncio.sleep(REPORT_INTERVAL)
+
+                # Watchdog de conexión "zombie": BlueZ puede reportar la
+                # conexión activa sin tráfico real (confirmado con btmon:
+                # ~3 eventos HCI en 12s, cero notificaciones ATT). Si no
+                # llegó ninguna lectura en STALE_CONNECTION_TIMEOUT
+                # segundos, se corta acá mismo para que monitor_loop
+                # reintente desde cero en vez de quedar pegado.
+                if time.time() - last_notification_ts > STALE_CONNECTION_TIMEOUT:
+                    log.warning(
+                        "[%s] Sin notificaciones HR hace %ds — conexión zombie, forzando reconexión",
+                        address, STALE_CONNECTION_TIMEOUT,
+                    )
+                    break
 
                 if latest_bpm is None:
                     continue
@@ -379,17 +436,34 @@ async def monitor_device(address: str, stop_event: asyncio.Event, store: HeartRa
                     else:
                         log.warning("[%s] Backend no disponible — reading en cola (id=%d)", address, row_id)
 
+    return latest_bpm is not None
+
 
 async def monitor_loop(address: str, store: HeartRateStore, flusher: BackendFlusher, stop_event: asyncio.Event):
+    fallos_consecutivos = 0
+
     while not stop_event.is_set():
         device_stop = asyncio.Event()
+        productivo = False
         try:
-            await monitor_device(address, device_stop, store, flusher)
+            productivo = await monitor_device(address, device_stop, store, flusher)
         except Exception as e:
             log.error("[%s] Error en monitor: %s", address, e)
 
         if stop_event.is_set():
             break
+
+        if productivo:
+            fallos_consecutivos = 0
+        else:
+            fallos_consecutivos += 1
+            log.warning("[%s] Intento sin datos reales (%d seguidos)", address, fallos_consecutivos)
+
+            if fallos_consecutivos >= RESTART_BLUETOOTH_AFTER_FAILURES:
+                await restart_bluetooth_stack()
+                fallos_consecutivos = 0
+            elif fallos_consecutivos >= RESET_CACHE_AFTER_FAILURES:
+                await clear_ble_cache(address)
 
         log.info("[%s] Reconectando en %ds...", address, RECONNECT_DELAY)
         await asyncio.sleep(RECONNECT_DELAY)
