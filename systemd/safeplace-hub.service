@@ -1,0 +1,28 @@
+[Unit]
+Description=SafePlace BLE Gateway
+Documentation=https://github.com/germanjugo/safeplace-hub
+After=network-online.target bluetooth.target
+Wants=network-online.target bluetooth.target
+
+[Service]
+Type=simple
+User=safeplace
+WorkingDirectory=/home/safeplace/safeplace-hub
+EnvironmentFile=/home/safeplace/safeplace-hub/.env
+
+# Qué lector se levanta lo decide HUB_MODE en el .env (garmin | xiaomi | both).
+ExecStart=/home/safeplace/safeplace-hub/hub_entrypoint.sh
+
+# El stack BLE de BlueZ tarda en estar listo después del boot; sin esto el
+# primer arranque falla y hay que esperar al reintento.
+ExecStartPre=/bin/sleep 5
+
+Restart=always
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=safeplace-hub
+
+[Install]
+WantedBy=multi-user.target
