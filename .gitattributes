@@ -1,0 +1,7 @@
+# Todo esto se ejecuta en la Raspberry (Linux). Con finales de línea CRLF el
+# shebang se rompe ("bad interpreter: /usr/bin/env bash^M") y systemd no
+# levanta la unit, así que se fuerza LF aunque se clone desde Windows.
+*.sh      text eol=lf
+*.py      text eol=lf
+*.service text eol=lf
+.env.example text eol=lf
