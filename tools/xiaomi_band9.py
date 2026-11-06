@@ -42,6 +42,14 @@ ADAPTER = os.getenv("BAND_ADAPTER", "hci0")
 # estando en alcance BLE. Va en el .env (ignorado por git), nunca en el código.
 _AUTH_KEY_HEX = os.getenv("BAND_AUTH_KEY", "")
 
+# Un periférico BLE sólo acepta conexiones mientras se anuncia. Si la Band está
+# apagada, fuera de alcance o tomada por el celular (la app la retiene y la Band
+# deja de anunciarse), BlueZ se queda esperando adentro de Connect() hasta que
+# vence el timeout de D-Bus y el proceso muere. Por eso primero la buscamos en
+# el aire y recién cuando aparece intentamos conectar.
+ESPERA_ANUNCIO_SEG = int(os.getenv("BAND_ADVERT_TIMEOUT", "60"))
+REINTENTO_SEG = int(os.getenv("BAND_RETRY_DELAY", "20"))
+
 # Los paths D-Bus (/serviceXXXX/charYYYY) los asigna BlueZ y difieren entre
 # Raspberrys y entre resets del caché GATT, así que se descubren por UUID.
 UUID_TX = "0000005f-0000-1000-8000-00805f9b34fb"   # FE95, write-without-response
@@ -155,13 +163,21 @@ class AuthError(RuntimeError):
     pass
 
 
+class BandAusente(RuntimeError):
+    """La Band todavía no está disponible. No es un error de configuración:
+    puede estar apagada, fuera de alcance o conectada al celular."""
+    pass
+
+
 class Band9:
     def __init__(self, mac: str, auth_key: bytes, adapter: str = ADAPTER):
         self.mac = mac
         self.auth_key = auth_key
-        self.dev_path = f"/org/bluez/{adapter}/dev_" + mac.replace(":", "_")
+        self.adapter_path = f"/org/bluez/{adapter}"
+        self.dev_path = f"{self.adapter_path}/dev_" + mac.replace(":", "_")
         self.bus = dbus.SystemBus()
         self.tx_path = self.rx_path = None
+        self._match = None
         self._buf = bytearray()
         self._frames = []
         self._lock = threading.Lock()
@@ -188,23 +204,67 @@ class Band9:
         except dbus.DBusException:
             return None
 
+    def _adaptador(self):
+        return dbus.Interface(self.bus.get_object("org.bluez", self.adapter_path),
+                              "org.bluez.Adapter1")
+
+    def _descubrir(self, encender: bool):
+        """Prende o apaga el scan tolerando que ya esté en ese estado."""
+        try:
+            adap = self._adaptador()
+            if encender:
+                adap.StartDiscovery()
+            else:
+                adap.StopDiscovery()
+        except dbus.DBusException as e:
+            log.debug("discovery(%s): %s", encender, e.get_dbus_name())
+
+    def esperar_anuncio(self, timeout=ESPERA_ANUNCIO_SEG):
+        """Espera a ver a la Band en el aire. Devuelve True si apareció.
+
+        BlueZ publica RSSI sobre el objeto del dispositivo sólo mientras lo
+        está viendo anunciarse, así que esa propiedad es la señal de que
+        conectarse tiene sentido.
+        """
+        if self._dev_prop("RSSI") is not None:
+            return True
+
+        log.info("Esperando a que %s se anuncie (hasta %ds)...", self.mac, timeout)
+        self._descubrir(True)
+        try:
+            limite = time.time() + timeout
+            while time.time() < limite:
+                rssi = self._dev_prop("RSSI")
+                if rssi is not None:
+                    log.info("%s está en el aire (RSSI %s)", self.mac, int(rssi))
+                    return True
+                time.sleep(1.0)
+        finally:
+            self._descubrir(False)
+        return False
+
     def ensure_connected(self, timeout=30):
-        """La Band bondeada no advierte, así que se conecta por path D-Bus, no por scan."""
+        """Conecta por path D-Bus, pero recién cuando la Band se está anunciando."""
         if self._dev_prop("Address") is None:
             raise AuthError(
                 f"{self.mac} no figura en BlueZ. ¿Falta emparejar? "
                 f"Corré tools/pair_band9.py")
 
         if not bool(self._dev_prop("Connected")):
+            if not self.esperar_anuncio():
+                raise BandAusente(
+                    f"{self.mac} no se anuncia: puede estar apagada, fuera de "
+                    f"alcance, o conectada al celular (mientras la app la "
+                    f"retiene, la Band deja de anunciarse)")
             log.info("Conectando a %s...", self.mac)
-            self._device().Connect()
+            self._device().Connect(timeout=timeout)
 
         deadline = time.time() + timeout
         while time.time() < deadline:
             if bool(self._dev_prop("ServicesResolved")):
                 return
             time.sleep(0.5)
-        raise AuthError("timeout esperando ServicesResolved")
+        raise BandAusente("timeout esperando ServicesResolved")
 
     def resolve_chars(self):
         """Ubica TX/RX por UUID: los paths de BlueZ cambian entre equipos."""
@@ -288,7 +348,10 @@ class Band9:
         self.ensure_connected()
         self.resolve_chars()
 
-        self._props(self.rx_path).connect_to_signal("PropertiesChanged", self._on_value)
+        if self._match is not None:
+            self._match.remove()
+        self._match = self._props(self.rx_path).connect_to_signal(
+            "PropertiesChanged", self._on_value)
         self._gatt(self.rx_path).StartNotify()
         time.sleep(1.2)
 
@@ -367,6 +430,16 @@ class Band9:
                                             + pb_varint(2, CMD_RT_STOP)))
         except Exception:
             pass
+        # Sin esto cada reintento dejaría otro handler escuchando el mismo
+        # characteristic y los frames se procesarían varias veces.
+        if self._match is not None:
+            try:
+                self._match.remove()
+            except Exception:
+                pass
+            self._match = None
+        self._clear()
+        self._buf.clear()
 
 
 # ─── Envío al backend ─────────────────────────────────────────────────
@@ -447,29 +520,51 @@ def main():
     loop = GLib.MainLoop()
     rc = [0]
 
+    interval = args.poll or 0
+
+    def una_pasada():
+        """Un ciclo completo: conectar, autenticar y leer hasta que se corte."""
+        band.connect()
+        if backend and backend.resolve() is None:
+            log.error("La MAC %s no está cargada en el backend", mac)
+            return 1
+
+        while True:
+            bpm = band.read_hr()
+            if bpm is None:
+                log.warning("sin lectura")
+            else:
+                sent = backend.post(bpm) if backend else None
+                log.info("HR %d bpm%s", bpm,
+                         "" if sent is None else ("  → backend OK" if sent else "  → backend FALLÓ"))
+            if not interval:
+                return 0
+            time.sleep(interval)
+
     def work():
         try:
-            band.connect()
-            if backend and backend.resolve() is None:
-                log.error("La MAC %s no está cargada en el backend", mac)
-                rc[0] = 1
-                return
-
-            interval = args.poll or 0
             while True:
-                bpm = band.read_hr()
-                if bpm is None:
-                    log.warning("sin lectura")
-                else:
-                    sent = backend.post(bpm) if backend else None
-                    log.info("HR %d bpm%s", bpm,
-                             "" if sent is None else ("  → backend OK" if sent else "  → backend FALLÓ"))
+                try:
+                    rc[0] = una_pasada()
+                    return
+                except BandAusente as e:
+                    log.warning("%s", e)
+                except AuthError as e:
+                    log.error("Auth: %s", e)
+                    rc[0] = 1
+                    return
+                except dbus.DBusException as e:
+                    log.warning("BlueZ: %s", e.get_dbus_message() or e)
+
+                # En una corrida puntual se sale; en modo --poll no, porque la
+                # Band puede volver sola (se prende, vuelve al alcance o el
+                # celular la suelta) y entonces engancha sin que nadie toque nada.
                 if not interval:
-                    break
-                time.sleep(interval)
-        except AuthError as e:
-            log.error("Auth: %s", e)
-            rc[0] = 1
+                    rc[0] = 1
+                    return
+                band.stop()
+                log.info("Nuevo intento en %ds", REINTENTO_SEG)
+                time.sleep(REINTENTO_SEG)
         except KeyboardInterrupt:
             pass
         except Exception as e:
