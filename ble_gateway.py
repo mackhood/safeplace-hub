@@ -378,69 +378,77 @@ async def monitor_device(address: str, stop_event: asyncio.Event, store: HeartRa
             reportado_desconexion = True
             log.warning("[%s] Dispositivo desconectado", address)
             stop_event.set()
-            asyncio.create_task(report_connection_state(session, device_id, "DESCONECTADO"))
 
         log.info("Conectando a %s...", address)
-        async with BleakClient(address, timeout=CONNECT_TIMEOUT_SEGUNDOS, disconnected_callback=on_disconnect) as client:
-            conectado = True
-            last_notification_ts = time.time()
-            log.info("Conectado a %s", address)
-            await report_connection_state(session, device_id, "CONECTADO")
-            await client.start_notify(HR_CHAR_UUID, on_hr)
+        try:
+            async with BleakClient(address, timeout=CONNECT_TIMEOUT_SEGUNDOS, disconnected_callback=on_disconnect) as client:
+                conectado = True
+                last_notification_ts = time.time()
+                log.info("Conectado a %s", address)
+                await report_connection_state(session, device_id, "CONECTADO")
+                await client.start_notify(HR_CHAR_UUID, on_hr)
 
-            while not stop_event.is_set():
-                await asyncio.sleep(REPORT_INTERVAL)
+                while not stop_event.is_set():
+                    await asyncio.sleep(REPORT_INTERVAL)
 
-                # Watchdog de conexión "zombie": BlueZ puede reportar la
-                # conexión activa sin tráfico real (confirmado con btmon:
-                # ~3 eventos HCI en 12s, cero notificaciones ATT). Si no
-                # llegó ninguna lectura en STALE_CONNECTION_TIMEOUT
-                # segundos, se corta acá mismo para que monitor_loop
-                # reintente desde cero en vez de quedar pegado.
-                if time.time() - last_notification_ts > STALE_CONNECTION_TIMEOUT:
-                    log.warning(
-                        "[%s] Sin notificaciones HR hace %ds — conexión zombie, forzando reconexión",
-                        address, STALE_CONNECTION_TIMEOUT,
-                    )
-                    break
-
-                if latest_bpm is None:
-                    continue
-
-                # --- Detección de pulso "congelado" ---
-                if latest_bpm == stuck_run["bpm"]:
-                    stuck_run["count"] += 1
-                else:
-                    if stuck_run["reported"]:
-                        log.info("[%s] Pulso vuelve a variar (%d BPM) — CONECTADO", address, latest_bpm)
-                        await report_connection_state(session, device_id, "CONECTADO")
-                    stuck_run.update(bpm=latest_bpm, count=1, reported=False)
-
-                if stuck_run["count"] >= STUCK_READINGS_THRESHOLD:
-                    if not stuck_run["reported"]:
+                    # Watchdog de conexión "zombie": BlueZ puede reportar la
+                    # conexión activa sin tráfico real (confirmado con btmon:
+                    # ~3 eventos HCI en 12s, cero notificaciones ATT). Si no
+                    # llegó ninguna lectura en STALE_CONNECTION_TIMEOUT
+                    # segundos, se corta acá mismo para que monitor_loop
+                    # reintente desde cero en vez de quedar pegado.
+                    if time.time() - last_notification_ts > STALE_CONNECTION_TIMEOUT:
                         log.warning(
-                            "[%s] %d lecturas iguales seguidas (%d BPM) — se reporta DESCONECTADO",
-                            address, stuck_run["count"], latest_bpm,
+                            "[%s] Sin notificaciones HR hace %ds — conexión zombie, forzando reconexión",
+                            address, STALE_CONNECTION_TIMEOUT,
                         )
-                        await report_connection_state(session, device_id, "DESCONECTADO")
-                        stuck_run["reported"] = True
-                    continue  # no se guarda ni se envía un pulso congelado
+                        break
 
-                actividad = estimator.update(latest_bpm)
-                reading = HRReading(
-                    bpm=latest_bpm, timestamp=time.time(),
-                    device_address=address, actividad=actividad,
-                )
-                row_id = store.save(reading)
-                log.debug("[%s] Guardado en SQLite (id=%d, act=%s)", address, row_id, actividad)
+                    if latest_bpm is None:
+                        continue
 
-                if BACKEND_ENABLED:
-                    ok = await _post_to_backend(session, reading)
-                    if ok:
-                        store.mark_sent([row_id])
-                        await flusher.flush(session)
+                    # --- Detección de pulso "congelado" ---
+                    if latest_bpm == stuck_run["bpm"]:
+                        stuck_run["count"] += 1
                     else:
-                        log.warning("[%s] Backend no disponible — reading en cola (id=%d)", address, row_id)
+                        if stuck_run["reported"]:
+                            log.info("[%s] Pulso vuelve a variar (%d BPM) — CONECTADO", address, latest_bpm)
+                            await report_connection_state(session, device_id, "CONECTADO")
+                        stuck_run.update(bpm=latest_bpm, count=1, reported=False)
+
+                    if stuck_run["count"] >= STUCK_READINGS_THRESHOLD:
+                        if not stuck_run["reported"]:
+                            log.warning(
+                                "[%s] %d lecturas iguales seguidas (%d BPM) — se reporta DESCONECTADO",
+                                address, stuck_run["count"], latest_bpm,
+                            )
+                            await report_connection_state(session, device_id, "DESCONECTADO")
+                            stuck_run["reported"] = True
+                        continue  # no se guarda ni se envía un pulso congelado
+
+                    actividad = estimator.update(latest_bpm)
+                    reading = HRReading(
+                        bpm=latest_bpm, timestamp=time.time(),
+                        device_address=address, actividad=actividad,
+                    )
+                    row_id = store.save(reading)
+                    log.debug("[%s] Guardado en SQLite (id=%d, act=%s)", address, row_id, actividad)
+
+                    if BACKEND_ENABLED:
+                        ok = await _post_to_backend(session, reading)
+                        if ok:
+                            store.mark_sent([row_id])
+                            await flusher.flush(session)
+                        else:
+                            log.warning("[%s] Backend no disponible — reading en cola (id=%d)", address, row_id)
+        finally:
+            # Este POST tiene que esperarse aca. Antes salia por
+            # asyncio.create_task() desde on_disconnect, y la tarea corria
+            # cuando esta ClientSession ya estaba cerrada: moria con
+            # "Connector is closed", el backend nunca se enteraba del corte
+            # y por eso no saltaba INACTIVIDAD_PROLONGADA.
+            if reportado_desconexion:
+                await report_connection_state(session, device_id, "DESCONECTADO")
 
     return latest_bpm is not None
 
