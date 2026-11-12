@@ -35,6 +35,16 @@ dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
 
 log = logging.getLogger("xiaomi-band9")
 
+# Fallos de red transitorios: el backend puede no estar resoluble todavia
+# cuando la Pi recien arranca (la red tarda mas que el servicio). Se reintenta
+# en vez de morir, que es lo que pasaba: el proceso salia con rc=1 y quedaba
+# dependiendo de que systemd lo reiniciara con la red ya lista.
+try:
+    import requests as _requests
+    ERRORES_RED = (_requests.exceptions.RequestException, OSError)
+except ImportError:
+    ERRORES_RED = (OSError,)
+
 MAC = os.getenv("BAND_MAC", "")
 ADAPTER = os.getenv("BAND_ADAPTER", "hci0")
 
@@ -555,6 +565,9 @@ def main():
                     return
                 except dbus.DBusException as e:
                     log.warning("BlueZ: %s", e.get_dbus_message() or e)
+                except ERRORES_RED as e:
+                    log.warning("Backend inalcanzable (%s) - se reintenta",
+                                type(e).__name__)
 
                 # En una corrida puntual se sale; en modo --poll no, porque la
                 # Band puede volver sola (se prende, vuelve al alcance o el
